@@ -188,6 +188,27 @@ AM_CONDITIONAL([SUPPRESS_FILE_IO],  [test "$enable_file_io" != yes])
 
 
 
+# Use GNU pthread_timedjoin_np() [non-portable], in ne_close(), instead of
+# pthread_join().  This means a stuck thread will get cancelled and treated
+# as though it had produced an error, instead of hanging ne_close()
+# forever.
+#
+# Note that the internal functions being used by the threads are already
+# supposed to have their own timeout behavior.  For example, rsocket
+# interactions in RDMA have their own timeouts.  If --enable-debug is also
+# used, this extends those RDMA timeouts, so that they won't engage during
+# debugging (e.g. in case we want to walk slowly through protocol
+# interactions without timing out).  I think it is unlikely that
+# --enable-timed-join would interact badly with that.
+
+AC_ARG_ENABLE(timed-join,
+              AS_HELP_STRING([--enable-timed-join], [ne_close() shouldn't wait forever in thread_join]),
+              [enable_timed_join=$enableval],
+              [enable_timed_join=no])
+AM_CONDITIONAL([TIMED_JOIN], [test x$enable_timed_join = xyes])
+
+
+
 # Delete me.  These flags are now installed at run-time, via ne_open1() or
 # ne_open1_vl().  MarFS does this installation through the DAL, at
 # open-time.
@@ -267,6 +288,9 @@ AM_CONDITIONAL([TEST_API],  [test "x$enable_test_api" != "xno"])
 AC_ARG_ENABLE(gprof,
    AS_HELP_STRING([--enable-gprof], [Dump run-time profiling info for gprof]))
 AM_CONDITIONAL([GPROF], [test x$enable_gprof = xyes])
+
+
+
 
 
 

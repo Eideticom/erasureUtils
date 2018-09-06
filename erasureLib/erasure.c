@@ -124,6 +124,11 @@ underlying skt_etc() functions.
 #endif
 
 #include <assert.h>
+
+#if (TIMED_JOIN) && (! defined _GNU_SOURCE)
+// _GNU_SOURCE + <pthread.h> gets us pthread_tryjoin_np(), pthread_timedjoin_np()
+#  define _GNU_SOURCE
+#endif
 #include <pthread.h>
 
 
@@ -2405,11 +2410,44 @@ int ne_close( ne_handle handle )
       counter++;
    }
 
+#if TIMED_JOIN
+   // initialize timeout to use, if we are doing timed-joins
+   // clock starts now, for all threads.
+   struct timespec timeout = {0};
+
+   const size_t    TIMEOUT_SEC = 35;
+   if (clock_gettime(CLOCK_REALTIME, &timeout))
+      PRINTdbg("failed to get timer '%s'\n", strerror(errno));
+   else
+      timeout.tv_sec += TIMEOUT_SEC;
+#endif
+
+
+   // threads have all been signalled BQ_FINISHED
    if(handle->mode == NE_WRONLY) {
      int i;
+
      /* wait for the threads */
      for(i = 0; i < handle->N + handle->E; i++) {
-       pthread_join(handle->threads[i], NULL);
+
+
+#if TIMED_JOIN
+        // don't wait forever, if some thread is stuck (see object_stream.c)
+        int rc = pthread_timedjoin_np(handle->threads[i], NULL, &timeout);
+        PRINTdbg("pthread_timedjoin_np (thread %d) returned %d (errno=%d)\n", i, rc, errno);
+
+        if (rc) {
+           if (! pthread_cancel(handle->threads[i]))
+              pthread_join(handle->threads[i], NULL);
+
+           PRINTdbg("canceled thread %d\n", i);
+           handle->blocks[i].flags |= BQ_ERROR; /* treat as failure */
+        }
+#else
+        pthread_join(handle->threads[i], NULL);
+#endif
+
+
        /* add up the errors */
        if((handle->blocks[i].flags & BQ_ERROR) && !handle->src_in_err[i]) {
          handle->src_in_err[i] = 1;

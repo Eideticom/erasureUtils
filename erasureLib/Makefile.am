@@ -93,6 +93,11 @@ else
 endif
 
 
+if TIMED_JOIN
+AM_CPPFLAGS += -DTIMED_JOIN=1
+endif
+
+
 if GPROF
   AM_CFLAGS  += -pg
   AM_LDFLAGS += -pg
