@@ -371,7 +371,7 @@ int main( int argc, const char* argv[] )
 
 
 
-#  define NE_OPEN(PATH, MODE, ...)    ne_open1  (select_snprintf(PATH), NULL, select_impl(PATH), auth, timing_flags, \
+#  define NE_OPEN(PATH, MODE, ...)    ne_open1  (select_snprintf(PATH), NULL, select_impl(PATH), NULL, auth, timing_flags, \
                                                  (PATH), (MODE), ##__VA_ARGS__ )
 
 #  define NE_DELETE(PATH, WIDTH)      ne_delete1(select_snprintf(PATH), NULL, select_impl(PATH), auth, timing_flags, \

@@ -198,6 +198,34 @@ typedef enum {
 
 struct handle; // forward decl.
 
+#define OPEN_RULE 1
+#define READ_RULE 2
+#define WRITE_RULE 3
+#define CLOSE_RULE 4
+#define STALL 1
+#define FAIL 2
+//function ptr used in dal to check for matching udal rule
+typedef  int (*check_udal_rule)(int func, void* state, int blk);
+
+typedef struct svr_rule {
+    int rule_type;
+    int mode;
+    int pod;
+    int cap;
+    int blk;
+    unsigned int seed;
+    double fail_freq;
+    unsigned int stall_time_sec;
+    double stall_freq;
+    int err;
+} Server_Rule;
+
+typedef struct udal_rules{
+    int num_rules;
+    Server_Rule* rules;
+    check_udal_rule check_rule;
+} Udal_Rules;
+
 typedef struct buffer_queue {
   pthread_mutex_t    qlock;
   void              *buffers[MAX_QDEPTH];
@@ -347,6 +375,7 @@ struct handle {
    /* run-time dispatch of sockets versus file implementation */
    const uDAL*    impl;
 
+   Udal_Rules*    udal_rules; //passed from marfs dal
    /* optional timing/benchmarking */
    TimingFlags    timing_flags;      /* initialized at build-time */
    BenchStats     stats[ MAXPARTS ]; /* ops w/in each thread */
@@ -357,6 +386,7 @@ struct handle {
    //char*          repo;
    char*          timing_stats;
    //int*           pod_id;
+
 };
 typedef struct handle* ne_handle;
 
@@ -382,7 +412,7 @@ typedef struct handle* ne_handle;
 //       work can be done using the RDMA uDAL.
 
 ne_handle ne_open1  ( SnprintfFunc func, void* state,
-                      uDALType itype, SktAuth auth, TimingFlagsValue flags,
+                      uDALType itype, Udal_Rules* rules, SktAuth auth, TimingFlagsValue flags,
                       char *path, ne_mode mode, ... );
 
 int       ne_delete1( SnprintfFunc func, void* state,

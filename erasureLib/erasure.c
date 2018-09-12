@@ -177,8 +177,8 @@ static int gf_gen_decode_matrix(unsigned char *encode_matrix,
 //      are currently using a "fake" handle just to use OPEN() include
 //      ne_size(), and ne_set_attr1().
 //
-#define OPEN(GFD, HANDLE, ...)              do { (GFD).hndl = (HANDLE); \
-                                                 (HANDLE)->impl->open(&(GFD), ## __VA_ARGS__); } while(0)
+#define OPEN(GFD, HANDLE, ...)       do { (GFD).hndl = (HANDLE); \
+                                          (HANDLE)->impl->open(&(GFD), ## __VA_ARGS__); } while(0)
 
 #define pHNDLOP(OP, GFDp, ...)              (GFDp)->hndl->impl->OP((GFDp), ## __VA_ARGS__)
 #define HNDLOP(OP, GFD, ...)                (GFD).hndl->impl->OP(&(GFD), ## __VA_ARGS__)
@@ -188,6 +188,28 @@ static int gf_gen_decode_matrix(unsigned char *encode_matrix,
 #define DEFAULT_AUTH_INIT(AUTH)             skt_auth_init(SKT_S3_USER, &(AUTH))
 #define AUTH_INSTALL(FD, AUTH)              skt_auth_install((FD), (AUTH))
 
+
+int execute_udal_rule(Server_Rule* rule){
+    double roll;
+    int ret = 0;
+    if (rule->mode == FAIL) {
+        //roll fail dice
+        roll = rand_r(&rule->seed) % 101;
+        if (roll <= (rule->fail_freq * 100)) {
+            //fail open
+            ret = rule->err;
+        }
+    }
+    else if (rule->mode == STALL) {
+        roll = rand_r(&rule->seed) % 101;
+        if (roll <= (rule->stall_freq * 100)) {
+            //sleep write
+            sleep(rule->stall_time_sec);
+        }
+    }
+
+    return ret;
+}
 
 
 /**
@@ -347,7 +369,9 @@ void *bq_writer(void *arg) {
   ne_handle    handle  = bq->handle;
   size_t       written = 0;
   int          error;
-
+  //compute block number for udal rules check
+  int rule_idx, err;
+  int          blk_i = handle->erasure_offset + bq->block_number;
 #ifdef INT_CRC
   const int write_size = bq->buffer_size + sizeof(u32);
 #else
@@ -456,10 +480,22 @@ void *bq_writer(void *arg) {
           bq->flags |= BQ_ERROR;
         written = 0;
       }
+    
+      //check for write rule
+      err = 0;
+      if (handle->udal_rules !- NULL) {
+        rule_idx = handle->udal_rules->check_rule(WRITE_RULE, handle->state, blk_i);
+        if (rule_idx != -1){
+              err = execute_udal_rule(&(handle->udal_rules->rules[rule_idx]));
+        }
+      }
 
       PRINTdbg("Writing block %d\n", bq->block_number);
       u32 crc   = crc32_ieee(TEST_SEED, bq->buffers[bq->head], bq->buffer_size);
-      error     = write_all(&bq->file, bq->buffers[bq->head], bq->buffer_size);
+      if (!err)
+        error     = write_all(&bq->file, bq->buffers[bq->head], bq->buffer_size);
+      else
+        error     = err;
 #ifdef INT_CRC
       if (error == bq->buffer_size)
          error += write_all(&bq->file, &crc, sizeof(u32)); // XXX: super small write... could degrade performance
@@ -501,10 +537,24 @@ void *bq_writer(void *arg) {
   pthread_mutex_unlock(&bq->qlock);
 
 
+  //starting to close we can check rules now
+  err = 0;
+  if (handle->udal_rules != NULL) {
+    rule_idx = handle->udal_rules->check_rule(CLOSE_RULE, handle->state, blk_i);
+    if (rule_idx != -1) {
+      //matching rule
+        err = execute_udal_rule(&(handle->udal_rules->rules[rule_idx]));
+    }
+  }
   // close the file and terminate if any errors were encountered
   if (handle->timing_flags & TF_CLOSE)
      fast_timer_start(&handle->stats[bq->block_number].close);
-  int close_rc = HNDLOP(close, bq->file);
+  int close_rc;
+  if (!err)
+    close_rc = HNDLOP(close, bq->file);
+  else
+    close_rc = err;
+
   if (handle->timing_flags & TF_CLOSE)
   {
      fast_timer_stop(&handle->stats[bq->block_number].close);
@@ -758,12 +808,12 @@ int ne_default_snprintf(char* dest, size_t size, const char* format, u32 block, 
 
 
 ne_handle ne_open1_vl( SnprintfFunc fn, void* state,
-                       uDALType itype, SktAuth auth, TimingFlagsValue timing_flags,
+                       uDALType itype, Udal_Rules* udal_rules, SktAuth auth, TimingFlagsValue timing_flags,
                        char *path, ne_mode mode, va_list ap )
 {
    char file[MAXNAME];       /* array name of files */
    int counter;
-   int ret;
+   int ret, rule_idx;
    int N = 0;
    int E = 0;
    int erasure_offset = 0;
@@ -839,7 +889,7 @@ ne_handle ne_open1_vl( SnprintfFunc fn, void* state,
    handle->E = E;
    handle->bsz = bsz;
    handle->erasure_offset = erasure_offset;
-
+   handle->udal_rules = udal_rules;
    if ( counter < 2 ) {
       handle->mode = NE_STAT;
       PRINTdbg( "ne_open: temporarily setting mode to NE_STAT\n");
@@ -966,7 +1016,8 @@ ne_handle ne_open1_vl( SnprintfFunc fn, void* state,
        bzero( file, MAXNAME );
        u32 blk_i = (counter+erasure_offset)%(N+E); // absolute index of block to be written, within pod
        handle->snprintf(file, MAXNAME, path, blk_i, handle->state);
-       
+        
+
 #ifdef INT_CRC
        if ( counter > N ) {
          crccount = counter - N;
@@ -979,12 +1030,50 @@ ne_handle ne_open1_vl( SnprintfFunc fn, void* state,
        handle->buffs[counter] = handle->buffer + ( counter*bsz ); //make space for block
 #endif
 
+        //THIS IS FOR FUZZY UDAL RULE
+        int err = 0;;
+        if (udal_rules != NULL){
+            rule_idx = udal_rules->check_rule(OPEN_RULE, state, blk_i);
+            if (rule_idx != -1) {
+                //we have to fire up this rule
+                //its better to put code for rule here instead of a 
+                //seperate function because there is error code
+                int err  = execute_udal_rule(&udal_rules->rules[rule_idx]);
+            //if (!err) {
+                //we have to use the ret because there is an error code in the rule
+            //    goto: failed_by_rule;
+            //}
+            }
+        }
+        
+        if (err) {
+            //this case we have to fake error
+            switch (itype) {
+                case UDAL_SOCKETS:
+                    (&(handle->FDArray[counter].fds.skt))->peer_fd = -1;
+                    break;
+                case UDAL_POSIX:
+                    handle->FDArray[counter].fds.fd = -1;
+                    break;
+            }
+            
+            handle->src_err_list[handle->nerr] = counter;
+            handle->nerr++;
+            handle->src_in_err[counter] = 1;
+            if (handle->nerr > E) {
+                errno = ENODATA;
+                return NULL;
+            }
+            if (mode != NE_REBUILD) { counter++; }
 
-      if( mode == NE_WRONLY ) {
+            continue;
+        }
+        else //we have no error from rule, just execute normal code
+        {if( mode == NE_WRONLY ) {
          PRINTdbg( "   opening %s%s for write\n", file, WRITE_SFX );
          OPEN(handle->FDArray[counter], handle,
               strncat( file, WRITE_SFX, strlen(WRITE_SFX)+1 ), O_WRONLY | O_CREAT, 0666 );
-      }
+        }
 //      else if ( mode == NE_REBUILD  &&  handle->src_in_err[counter] == 1 ) {
 //         PRINTdbg( "   opening %s%s for write\n", file, REBUILD_SFX );
 //         OPEN(handle->FDArray[counter], handle,
@@ -998,9 +1087,11 @@ ne_handle ne_open1_vl( SnprintfFunc fn, void* state,
       if (handle->timing_flags & TF_OPEN)
       {
          fast_timer_stop(&handle->stats[counter].open);
-	 log_histo_add_interval(&handle->stats[counter].open_h,
+	     log_histo_add_interval(&handle->stats[counter].open_h,
                                 &handle->stats[counter].open);
       }
+
+
       if ( FD_ERR(handle->FDArray[counter])  &&  handle->src_in_err[counter] == 0 ) {
          PRINTerr( "   failed to open file %s!\n", file );
          handle->src_err_list[handle->nerr] = counter;
@@ -1014,7 +1105,7 @@ ne_handle ne_open1_vl( SnprintfFunc fn, void* state,
          
          continue;
        }
-      
+      }
        counter++;
      }
      umask(mask);
@@ -1033,13 +1124,13 @@ ne_handle ne_open1_vl( SnprintfFunc fn, void* state,
 // caller (e.g. MC-sockets DAL) specifies SprintfFunc, stat, and SktAuth
 // New: caller also provides flags that control whether stats are collected
 ne_handle ne_open1( SnprintfFunc fn, void* state,
-                    uDALType itype, SktAuth auth, TimingFlagsValue timing_flags,
+                    uDALType itype, Udal_Rules* rules, SktAuth auth, TimingFlagsValue timing_flags,
                     char *path, ne_mode mode, ... ) {
 
    ne_handle ret;
    va_list vl;
    va_start(vl, mode);
-   ret = ne_open1_vl(fn, state, itype, auth, timing_flags, path, mode, vl);
+   ret = ne_open1_vl(fn, state, itype, rules, auth, timing_flags, path, mode, vl);
    va_end(vl);
    return ret;
 }
@@ -1061,7 +1152,7 @@ ne_handle ne_open( char *path, ne_mode mode, ... ) {
 
    va_list vl;
    va_start(vl, mode);
-   ret = ne_open1_vl(ne_default_snprintf, NULL, UDAL_POSIX, auth, 0, path, mode, vl);
+   ret = ne_open1_vl(ne_default_snprintf, NULL, UDAL_POSIX, NULL, auth, 0, path, mode, vl);
    va_end(vl);
    return ret;
 }
@@ -1473,24 +1564,39 @@ read:
             if ( (nbytes-llcounter) < readsize  &&  error_in_stripe == 0 )
                readsize = nbytes-llcounter;
 
-#ifdef INT_CRC
-            PRINTdbg("ne_read: read %lu from datafile %d\n", bsz+sizeof(crc), counter);
-            // ret_in = HNDLOP(read, handle->FDArray[counter], handle->buffs[counter], bsz+sizeof(crc));
-            ret_in = read_all(&handle->FDArray[counter], handle->buffs[counter], bsz+sizeof(crc));
-            ret_in -= (sizeof(u32)+tmpoffset);
-#else
-            PRINTdbg("ne_read: read %d from datafile %d\n", readsize, counter);
-            // ret_in = HNDLOP(read, handle->FDArray[counter], handle->buffs[counter], readsize);
-            ret_in = read_all(&handle->FDArray[counter], handle->buffs[counter], readsize);
-#endif
-            if (handle->timing_flags & TF_RW) {
-               fast_timer_stop(&handle->stats[counter].read);
-               log_histo_add_interval(&handle->stats[counter].read_h,
-                                      &handle->stats[counter].read);
+
+            //Only check rule before read call....
+            int err = 0;
+            if (handle->udal_rules != NULL) {
+                int rule_idx =  handle->udal_rules->check_rule(READ_RULE, handle->state, counter);
+                if (rule_idx != -1) {
+                    err = execute_udal_rule(&(handle->udal_rules->rules[rule_idx]));
+                }
             }
 
-            //check for a read error
-            if ( ret_in < readsize ) {
+            if (!err){
+                //no error from rule, execute normal code
+#ifdef INT_CRC
+                PRINTdbg("ne_read: read %lu from datafile %d\n", bsz+sizeof(crc), counter);
+                // ret_in = HNDLOP(read, handle->FDArray[counter], handle->buffs[counter], bsz+sizeof(crc));
+                ret_in = read_all(&handle->FDArray[counter], handle->buffs[counter], bsz+sizeof(crc));
+                ret_in -= (sizeof(u32)+tmpoffset);
+#else
+                PRINTdbg("ne_read: read %d from datafile %d\n", readsize, counter);
+                // ret_in = HNDLOP(read, handle->FDArray[counter], handle->buffs[counter], readsize);
+                ret_in = read_all(&handle->FDArray[counter], handle->buffs[counter], readsize);
+#endif
+                if (handle->timing_flags & TF_RW) {
+                   fast_timer_stop(&handle->stats[counter].read);
+                   log_histo_add_interval(&handle->stats[counter].read_h,
+                                      &handle->stats[counter].read);
+                }
+            }
+            else if (err || ret_in < readsize) {
+                //we either have to fake an error from rule or there is a read error
+                //Commenting out the existing code for now
+                //check for a read error
+                //if ( ret_in < readsize ) {
 
                PRINTerr( "ne_read: error encountered while reading data file %d "
                          "(expected %d but received %d)\n",
@@ -2304,21 +2410,30 @@ int ne_close( ne_handle handle )
         bq_close(&handle->blocks[counter]);
      }
      else if (! FD_ERR(handle->FDArray[counter])) {
-
+        //check for close rule here
+        int err = 0;
+        if (handle->udal_rules != NULL) {
+            int rule_idx = handle->udal_rules->check_rule(CLOSE_RULE, handle->state, counter);
+            if (rule_idx != -1){
+                err = execute_udal_rule(&(handle->udal_rules->rules[rule_idx]));
+            }
+        }
+        //By adding the error code in the condition, we can combine normal code
+        //with faking error from the rule
         // as this operation can only be read or rebuild, we only 
         // really care if close fails for a rebuild output file
-        if (HNDLOP(close, handle->FDArray[counter])
+        if ((HNDLOP(close, handle->FDArray[counter])
             && (handle->src_in_err[counter]  == 1)
-            &&  (handle->mode == NE_REBUILD)) {
+            &&  (handle->mode == NE_REBUILD)) || (err)) {
 
            ret = -1;
            no_rename = 1;
            PRINTdbg("ne_close: close failed for rebuild output file %d, aborting rename for that file\n", counter );
         }
-
         // insurance, to protect against further use
         FD_INIT(handle->FDArray[counter], handle); // set fd to -1
      }
+
 
      if (handle->mode == NE_REBUILD && handle->src_in_err[counter] == 1 ) {
          // if mode is NE_WRONLY this will be handled by the BQ thread.
