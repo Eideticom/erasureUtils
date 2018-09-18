@@ -391,7 +391,7 @@ void *bq_writer(void *arg) {
   if (handle->udal_rules != NULL) {
         rule_idx = handle->udal_rules->check_rule(OPEN_RULE, handle->state, bq->block_number);
         if (rule_idx != -1) {
-            err = execute_udal_rule(handle->udal_rules->rules[rule_idx]);
+            err = execute_udal_rule(&handle->udal_rules->rules[rule_idx]);
         }
   }
 
@@ -405,16 +405,24 @@ void *bq_writer(void *arg) {
         fast_timer_stop(&handle->stats[bq->block_number].thread);
         exit(-1); // XXX: is this the appropriate response??
     }
-    if(FD_ERR(bq->file)) {
-        bq->flags |= BQ_ERROR;
-    }
-    else {
-        bq->flags |= BQ_OPEN;
-    }
   }
   else {
       //there is error from rule, fake error
-
+      switch (handle->itype)
+      {
+        case UDAL_SOCKETS:
+            (&(bq->file.fds.skt))->peer_fd = -1;
+            break;
+        case UDAL_POSIX:
+            bq->file.fds.fd = -1;
+            break;
+      }
+  }
+  if(FD_ERR(bq->file)) {
+    bq->flags |= BQ_ERROR;
+  }
+  else {
+    bq->flags |= BQ_OPEN;
   }
   pthread_cond_signal(&bq->empty);
   pthread_mutex_unlock(&bq->qlock);
@@ -496,9 +504,7 @@ void *bq_writer(void *arg) {
     
       //check for write rule
       err = 0;
-      printf("bq writer checking for udal_rules\n");
       if (handle->udal_rules != NULL) {
-          printf("making sure handle got the udal_rules pointer\n");
         rule_idx = handle->udal_rules->check_rule(WRITE_RULE, handle->state, blk_i);
         if (rule_idx != -1){
               err = execute_udal_rule(&(handle->udal_rules->rules[rule_idx]));
@@ -511,7 +517,6 @@ void *bq_writer(void *arg) {
         error     = write_all(&bq->file, bq->buffers[bq->head], bq->buffer_size);
       else
         error     = err;
-      printf("bq writer error return code %d\n", error);
 #ifdef INT_CRC
       if (error == bq->buffer_size)
          error += write_all(&bq->file, &crc, sizeof(u32)); // XXX: super small write... could degrade performance
@@ -827,7 +832,6 @@ ne_handle ne_open1_vl( SnprintfFunc fn, void* state,
                        uDALType itype, Udal_Rules* udal_rules, SktAuth auth, TimingFlagsValue timing_flags,
                        char *path, ne_mode mode, va_list ap )
 {
-    printf("ne_open udal_rules pointer val %p\n",udal_rules);
    char file[MAXNAME];       /* array name of files */
    int counter;
    int ret, rule_idx;
@@ -907,7 +911,6 @@ ne_handle ne_open1_vl( SnprintfFunc fn, void* state,
    handle->bsz = bsz;
    handle->erasure_offset = erasure_offset;
    handle->udal_rules = udal_rules;
-   printf("assigned udal_rule pointer in ne_open to ne_handle\n");
    if ( counter < 2 ) {
       handle->mode = NE_STAT;
       PRINTdbg( "ne_open: temporarily setting mode to NE_STAT\n");
@@ -1051,15 +1054,12 @@ ne_handle ne_open1_vl( SnprintfFunc fn, void* state,
         //THIS IS FOR FUZZY UDAL RULE
         int err = 0;
         if (udal_rules != NULL){
-            printf("ne_open checking udal rule \n");
             rule_idx = udal_rules->check_rule(OPEN_RULE, state, blk_i);
             if (rule_idx != -1) {
                 //we have to fire up this rule
                 //its better to put code for rule here instead of a 
                 //seperate function because there is error code
-                printf("ne_open has a matching open rule\n");
                 err  = execute_udal_rule(&udal_rules->rules[rule_idx]);
-                printf("open rule eerr %d\n", err);
             //if (!err) {
                 //we have to use the ret because there is an error code in the rule
             //    goto: failed_by_rule;
