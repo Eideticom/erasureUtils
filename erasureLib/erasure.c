@@ -387,21 +387,34 @@ void *bq_writer(void *arg) {
   PRINTdbg("entering thread for block %d, in %s\n", bq->block_number, bq->path);
   pthread_cleanup_push(bq_writer_finis, bq);
 
-  // open the file.
-  mode_t mask = umask( 0000 );  /* N/A for RDMA impl of OPEN() */
-  OPEN(bq->file, handle, bq->path, O_WRONLY|O_CREAT, 0666);
-  umask( mask );
-
-  if(pthread_mutex_lock(&bq->qlock) != 0) {
-    if (handle->timing_flags & TF_THREAD)
-       fast_timer_stop(&handle->stats[bq->block_number].thread);
-    exit(-1); // XXX: is this the appropriate response??
+  //before bq_writer open, we check for open rule
+  if (handle->udal_rules != NULL) {
+        rule_idx = handle->udal_rules->check_rule(OPEN_RULE, handle->state, bq->block_number);
+        if (rule_idx != -1) {
+            err = execute_udal_rule(handle->udal_rules->rules[rule_idx]);
+        }
   }
-  if(FD_ERR(bq->file)) {
-    bq->flags |= BQ_ERROR;
+
+  if (!err) {
+    // no error from rule, open the file.
+    mode_t mask = umask( 0000 );  /* N/A for RDMA impl of OPEN() */
+    OPEN(bq->file, handle, bq->path, O_WRONLY|O_CREAT, 0666);
+    umask( mask );
+    if(pthread_mutex_lock(&bq->qlock) != 0) {
+        if (handle->timing_flags & TF_THREAD)
+        fast_timer_stop(&handle->stats[bq->block_number].thread);
+        exit(-1); // XXX: is this the appropriate response??
+    }
+    if(FD_ERR(bq->file)) {
+        bq->flags |= BQ_ERROR;
+    }
+    else {
+        bq->flags |= BQ_OPEN;
+    }
   }
   else {
-    bq->flags |= BQ_OPEN;
+      //there is error from rule, fake error
+
   }
   pthread_cond_signal(&bq->empty);
   pthread_mutex_unlock(&bq->qlock);
@@ -907,7 +920,7 @@ ne_handle ne_open1_vl( SnprintfFunc fn, void* state,
    handle->state    = state;
    handle->auth     = auth;
    handle->impl     = get_impl(itype);
-
+   handle->itype    = itype;
    if (! handle->impl) {
       PRINTerr( "ne_open: couldn't find implementation for itype %d\n", itype );
       errno = EINVAL;

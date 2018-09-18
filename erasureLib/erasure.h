@@ -374,7 +374,7 @@ struct handle {
 
    /* run-time dispatch of sockets versus file implementation */
    const uDAL*    impl;
-
+   uDALType       itype;      //this must be saved for bq_writer
    Udal_Rules*    udal_rules; //passed from marfs dal
    /* optional timing/benchmarking */
    TimingFlags    timing_flags;      /* initialized at build-time */
