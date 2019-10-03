@@ -55,8 +55,10 @@
 #GNU licenses can be found at http://www.gnu.org/licenses/.
 #
 
+
 ACLOCAL_AMFLAGS = -I m4
 AUTOMAKE_OPTIONS = foreign
+LDADD += -L/home/users2/amaier/repos/libnoload6_master/build/libnoload.so
 
 
 ### nodist_include_HEADERS = libne_auto_config.h
@@ -64,6 +66,7 @@ AUTOMAKE_OPTIONS = foreign
 if ANY_SOCKETS
   MAYBE_SOCKETS = sockets
 endif
+
 
 SUBDIRS = fast_timer config  $(MAYBE_SOCKETS) erasureLib isal_benchmark
 

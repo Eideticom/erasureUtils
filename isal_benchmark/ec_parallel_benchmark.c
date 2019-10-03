@@ -44,6 +44,9 @@
 #include <limits.h>
 #include "zlib.h"
 #include "crc.h"
+#include "noload.h"
+#include "ring_queue.h"
+#include "util.h"
 #include "erasure_code.h"	// use <isa-l.h> instead when linking against installed
 
 /* default values */
@@ -70,9 +73,11 @@
 #define DECODE 1
 #define ENCODE_PHYSICAL 2
 
-#define NO_COMP 		0
-#define COMP_BEFORE_ENCODE 	1
-#define COMP_AFTER_ENCODE 	2
+#define NO_COMP 			0
+#define COMP_BEFORE_ENCODE 		1
+#define COMP_AFTER_ENCODE 		2
+#define NOLOAD_COMP_BEFORE_ENCODE 	3
+#define NOLOAD_COMP_AFTER_ENCODE 	4
 
 #define NO_CRC 0
 #define CRC_FIRST 1
@@ -254,11 +259,14 @@ static void _rdma_benchmark(char *server_name, int port, int thread_cnt, long lo
 void * encode_data(void *args);
 void * encode_data_compress_after_encode(void *args);
 void * encode_data_compress_before_encode(void *args);
+void * noload_encode_data_compress_after_encode(void *args);
+void * noload_encode_data_compress_before_encode(void *args);
 void * decode_data(void *args);
 void * decode_data_compress(void *args);
 void * server_thread(void *args);
 
 
+struct ring_queue *nlq;
 int main(int argc, char *argv[])
 {
 		
@@ -497,7 +505,7 @@ int main(int argc, char *argv[])
 	}
 
 	/* check compression option */
-	if (comp_opt < NO_COMP || comp_opt > COMP_AFTER_ENCODE) {
+	if (comp_opt < NO_COMP || comp_opt > NOLOAD_COMP_AFTER_ENCODE) {
 		fprintf(stderr, "Invalid compression option\n");
 		return 1;
 	}
@@ -524,6 +532,12 @@ int main(int argc, char *argv[])
                 case NO_COMP:
                         encode_func_ptr = encode_data;
                         break;
+		case NOLOAD_COMP_BEFORE_ENCODE:
+			encode_func_ptr = noload_encode_data_compress_before_encode;
+			break;		
+		case NOLOAD_COMP_AFTER_ENCODE:
+			encode_func_ptr = noload_encode_data_compress_after_encode;
+			break;
                 case COMP_BEFORE_ENCODE:
                         encode_func_ptr = encode_data_compress_before_encode;
                         break;
@@ -663,6 +677,26 @@ int main(int argc, char *argv[])
 
 	bws = (double *)malloc(thread_cnt * sizeof(double));
 	pbws = (double *)malloc(thread_cnt * sizeof(double));
+
+	struct noload *nl = noload_open("/dev/nvme0n1", 0);
+	if (!nl) {
+		fprintf(stderr, "Unable to open NoLoad: %m");
+		return -1;
+	}
+	nlq = ring_queue_create(ceil_pow2(noload_num_jobs_hint(nl) * 2), sizeof(struct noload_worker *), 0);
+	if (!nlq) {
+		fprintf(stderr,"Could not create worker pool: %m");
+		return -1;
+	}
+	for (size_t i=0; i < noload_num_jobs_hint(nl) * 2; ++i) {
+		struct noload_worker *nlw = noload_worker_create(nl, NOLOAD_TYPE_COMPRESS, 2,
+								 NOLOAD_IO_SYNC);
+		if (!nlw) {
+			fprintf(stderr, "Unable to create noload worker: %m");
+			return -1;
+		}
+		ring_queue_push(nlq, &nlw, 1);
+	}
 
 	/* start encoding */
 	fprintf(stdout, "**** Start encoding ****\n");
@@ -1131,6 +1165,272 @@ void *encode_data_compress_before_encode(void *args)
 }
 
 void * encode_data_compress_after_encode(void *args)
+{
+        int i, j, thread_id, k, p, m, flush, crc_opt;
+	unsigned int seed;
+        long long stripe_cnt, blk_size_abs, total_comp_size, data_size_abs;
+        struct timespec start, end;
+        u8 *frag_ptrs[MMAX];
+        u8 *g_tbls;
+	u8 **out;
+	u8 *comp_data;
+	u8 *comp_data_ptr;
+	unsigned long comp_data_size;
+	unsigned long comp_data_remain;
+	crc_func crc_func_ptr;
+        double bw, total_time, crc_time;
+	int crc_size = 0;
+	z_stream strm;
+
+        encode_thread_args *encode_args = (encode_thread_args *)args;
+        thread_id = encode_args->thread_id;
+	crc_opt = encode_args->crc_opt;
+        k = encode_args->k;
+        p = encode_args->p;
+        m = p + k;
+        data_size_abs = encode_args->data_size_abs;
+        blk_size_abs = encode_args->blk_size_abs;
+	comp_data_size = encode_args->comp_data_size;
+	comp_data = (u8 *)malloc(comp_data_size * sizeof(u8));
+	memcpy(comp_data, encode_args->comp_data, comp_data_size);
+	crc_func_ptr = encode_args->crc_func_ptr;
+	out = (u8 **)malloc(m * sizeof(u8 *));
+	for (i = 0; i < m; i++) {
+		out[i] = (u8 *)malloc(blk_size_abs * sizeof(u8) * 2);
+	}
+
+        if (numa_nodes != 0) {
+		_set_numa(thread_id);
+        }
+
+	stripe_cnt = ceil(((double)data_size_abs) / ((double)(k * blk_size_abs)));
+	fprintf(stdout, "thread id %d: stripe cnt %lld\n", thread_id, stripe_cnt);
+	/* allocate local input */
+        g_tbls = malloc(k * p * 32);
+        memcpy(g_tbls, encode_args->g_tbls, k * p * 32);
+        for (i = 0; i < m; i++) {
+                if (NULL == (frag_ptrs[i] = malloc(blk_size_abs))) {
+                        fprintf(stderr, "malloc error\n");
+                        exit(1);
+                }
+        }
+	
+	total_time = 0;
+	crc_time = 0;
+        /* add crc size */
+        if (crc_opt > NO_CRC)
+                crc_size = sizeof(uint32_t);
+        else
+                crc_size = 0;
+
+	/* give random data */
+	seed = thread_id;
+        for (i = 0; i < k; i++)
+                for (j = 0; j < blk_size_abs; j++)
+                        frag_ptrs[i][j] = rand_r(&seed);
+	if (crc_opt == CRC_FIRST) {
+                clock_gettime(CLOCK_MONOTONIC, &start);
+                crc_func_ptr(stripe_cnt, k, blk_size_abs, frag_ptrs);
+                clock_gettime(CLOCK_MONOTONIC, &end);
+                crc_time += (double)(end.tv_sec - start.tv_sec) + ((double)(end.tv_nsec - start.tv_nsec)/1000000000L);
+	}
+
+	/* setup zlib */
+	strm.zalloc = Z_NULL;
+	strm.zfree = Z_NULL;
+	strm.opaque = Z_NULL;
+	if (deflateInit(&strm, Z_DEFAULT_COMPRESSION)) {
+		fprintf(stderr, "Failed deflateInit\n");
+		exit(1);
+	}
+	total_comp_size = 0;
+	comp_data_remain = comp_data_size;
+	comp_data_ptr = comp_data;
+        /* process each stripe */
+        for (i = 0; i < stripe_cnt; i++) {
+		clock_gettime(CLOCK_MONOTONIC, &start);
+                ec_encode_data(blk_size_abs, k, p, g_tbls, frag_ptrs, &frag_ptrs[k]);
+		clock_gettime(CLOCK_MONOTONIC, &end);
+		total_time += (double)(end.tv_sec - start.tv_sec) + ((double)(end.tv_nsec - start.tv_nsec)/1000000000L);
+		if (crc_opt == CRC_SECOND) {
+			clock_gettime(CLOCK_MONOTONIC, &start);
+			crc_func_ptr(1, m, blk_size_abs, frag_ptrs);
+			clock_gettime(CLOCK_MONOTONIC, &end);
+			crc_time += (double)(end.tv_sec - start.tv_sec) + ((double)(end.tv_nsec - start.tv_nsec)/1000000000L);
+		}
+		flush = (i == stripe_cnt - 1? Z_FINISH : Z_NO_FLUSH);
+		for (j = 0; j < m; j++) {
+			if ((j < m - 1) || (j == m - 1 && (i < stripe_cnt - 1)))
+				flush = Z_NO_FLUSH;
+			else if ((i == stripe_cnt - 1) && (j == m - 1))
+				flush = Z_FINISH;
+			/* best effort to use compression input data to achieve desired compression ratio */
+			if (comp_data_remain < blk_size_abs) {
+				comp_data_ptr = comp_data;
+				comp_data_remain = comp_data_size;
+			}
+			clock_gettime(CLOCK_MONOTONIC, &start);
+			//long comp_size = _compress(frag_ptrs[i], out[j], blk_size_abs, &strm, flush, &total_comp_size);
+			long comp_size = _compress(comp_data_ptr, out[j], blk_size_abs, &strm, flush, &total_comp_size);
+			clock_gettime(CLOCK_MONOTONIC, &end);
+			total_time += (double)(end.tv_sec - start.tv_sec) + ((double)(end.tv_nsec - start.tv_nsec)/1000000000L);
+			comp_data_remain -= blk_size_abs;
+			comp_data_ptr += blk_size_abs;
+			if (crc_opt == CRC_LAST) {
+				clock_gettime(CLOCK_MONOTONIC, &start);
+				crc_func_ptr(1, 1, comp_size, &out[j]);
+				clock_gettime(CLOCK_MONOTONIC, &end);
+				crc_time += (double)(end.tv_sec - start.tv_sec) + ((double)(end.tv_nsec - start.tv_nsec)/1000000000L);
+			}
+		}
+        }
+
+	fprintf(stdout, "total data before compress %lld, after compress %lld\n", blk_size_abs * stripe_cnt * m, total_comp_size);
+        free(g_tbls);
+        for (i = 0; i < m; i++) {
+                free(frag_ptrs[i]);
+		free(out[i]);
+        }
+	free(out);
+	free(comp_data);
+        bw = (((double)(crc_size + stripe_cnt * blk_size_abs * (k + p))) / 1000000LL) / (total_time + crc_time);
+        encode_args->bws[thread_id] = bw;
+	bw = (((double)(total_comp_size + crc_size)) / 1000000LL) / (total_time + crc_time);
+	encode_args->pbws[thread_id] = bw;
+	printf("crc_time %f\n", crc_time);
+        return NULL;
+}
+
+void *noload_encode_data_compress_before_encode(void *args)
+{
+        int i, j, thread_id, k, p, m, flush, crc_opt;
+        long long stripe_cnt, stripe_cnt_comp, blk_size_abs, total_comp_size, total_comp_chunks, mod_bytes, comp_size, out_comp_size;
+	long long data_size_abs;
+	int crc_size = 0;
+	unsigned int seed;
+        struct timespec start, end;
+	u8 *comp_data;
+	unsigned long comp_data_size, comp_out_size;
+	u8 *out;
+	u8 *frag_ptrs[MMAX];
+        u8 *g_tbls;
+        double total_time, bw, crc_time;
+	crc_func crc_func_ptr;
+        z_stream strm;
+	int rc;
+
+        encode_thread_args *encode_args = (encode_thread_args *)args;
+        thread_id = encode_args->thread_id;
+	crc_opt = encode_args->crc_opt;
+	crc_func_ptr = encode_args->crc_func_ptr;
+        k = encode_args->k;
+        p = encode_args->p;
+        m = p + k;
+        data_size_abs = encode_args->data_size_abs;
+        blk_size_abs = encode_args->blk_size_abs;
+	printf("blk_size_abs: %llx\n", blk_size_abs);
+	comp_data_size = encode_args->comp_data_size;
+	comp_data = (u8 *)malloc(comp_data_size * sizeof(u8));
+	memcpy(comp_data, encode_args->comp_data, comp_data_size);
+	out_comp_size = (comp_data_size*112/100+10);
+	total_comp_size = out_comp_size;
+	out = (u8 *)malloc(total_comp_size * sizeof(u8));
+	total_comp_chunks = data_size_abs / comp_data_size;
+	mod_bytes = data_size_abs % comp_data_size;
+	stripe_cnt = ceil(((double)data_size_abs) / ((double)(k * blk_size_abs)));
+	fprintf(stdout, "thread_id %d: stripe cnt %lld, comp chunks %lld\n", thread_id, stripe_cnt, total_comp_chunks);
+	total_time = 0;
+	crc_time = 0;
+
+	if (numa_nodes != 0)
+		_set_numa(thread_id);
+       
+	 /* allocate local input */
+        g_tbls = malloc(k * p * 32);
+        memcpy(g_tbls, encode_args->g_tbls, k * p * 32);
+        for (i = 0; i < m; i++) {
+                if (NULL == (frag_ptrs[i] = malloc(blk_size_abs))) {
+                        fprintf(stderr, "malloc error\n");
+                        exit(1);
+                }
+        }
+	printf("NoLoad working\n");
+
+        /* give random data to compressed buf */
+        seed = thread_id;
+        for (i = 0; i < k; i++)
+                for (j = 0; j < blk_size_abs; j++)
+                        frag_ptrs[i][j] = rand_r(&seed);
+
+	/* add crc size */
+	if (crc_opt > NO_CRC)
+		crc_size = sizeof(uint32_t);
+	else
+		crc_size = 0;
+
+	/* crc before compression? */
+	if (crc_opt == CRC_FIRST) {
+		clock_gettime(CLOCK_MONOTONIC, &start);
+		crc_func_ptr(stripe_cnt, k, blk_size_abs, frag_ptrs);
+		clock_gettime(CLOCK_MONOTONIC, &end);
+		crc_time += (double)(end.tv_sec - start.tv_sec) + ((double)(end.tv_nsec - start.tv_nsec)/1000000000L);
+	}
+
+	struct noload_worker *nlw;
+	ring_queue_pop(nlq, &nlw, 1, 1);
+	for (i=0; i<total_comp_chunks; ++i) {
+		clock_gettime(CLOCK_MONOTONIC, &start);
+		comp_size = out_comp_size;
+		rc = noload_worker_run_mem(nlw, comp_data, comp_data_size, comp_data_size, out, &comp_size);
+		if (rc)
+			noload_perror("Could not run compression", rc);
+		clock_gettime(CLOCK_MONOTONIC, &end);
+		total_time += (double)(end.tv_sec - start.tv_sec) + ((double)(end.tv_nsec - start.tv_nsec)/1000000000L);
+		total_comp_size += comp_size;
+	}
+	ring_queue_push(nlq, &nlw, 1);
+
+	/* calculate stripe count after compression */
+	stripe_cnt_comp = ceil(((double)total_comp_size) / ((double)k * blk_size_abs));
+	fprintf(stdout, "thread %d: total data before compress %lld. Total data after compress %lld, stripe count after compress %lld\n", thread_id, data_size_abs, total_comp_size, stripe_cnt_comp);
+
+	/* crc fater compression? */
+	if (crc_opt == CRC_SECOND) {
+		clock_gettime(CLOCK_MONOTONIC, &start);
+		crc_func_ptr(stripe_cnt_comp, k, blk_size_abs, frag_ptrs);
+		clock_gettime(CLOCK_MONOTONIC, &end);
+		crc_time += (double)(end.tv_sec - start.tv_sec) + ((double)(end.tv_nsec - start.tv_nsec)/1000000000L);
+	}
+        /* process each stripe */
+        for (i = 0; i < stripe_cnt_comp; i++) {
+		clock_gettime(CLOCK_MONOTONIC, &start);
+                ec_encode_data(blk_size_abs, k, p, g_tbls, frag_ptrs, &frag_ptrs[k]);
+		clock_gettime(CLOCK_MONOTONIC, &end);
+		total_time += (double)(end.tv_sec - start.tv_sec) + ((double)(end.tv_nsec - start.tv_nsec)/1000000000L);
+		if (crc_opt == CRC_LAST) {
+			clock_gettime(CLOCK_MONOTONIC, &start);
+			crc_func_ptr(1, m, blk_size_abs, frag_ptrs);
+			clock_gettime(CLOCK_MONOTONIC, &end);
+			crc_time += (double)(end.tv_sec - start.tv_sec) + ((double)(end.tv_nsec - start.tv_nsec)/1000000000L);
+		}
+        }
+
+	/* calculate logical bandwidth */
+	bw = (((double)(data_size_abs + crc_size + (blk_size_abs * p * stripe_cnt_comp))) / 1000000LL) / (total_time + crc_time);
+	encode_args->bws[thread_id] = bw;
+	/* calculate physical bandwidth */
+	bw = ((((double)(stripe_cnt_comp * blk_size_abs * m + crc_size))) / 1000000LL) / (total_time + crc_time);
+	encode_args->pbws[thread_id] = bw;
+	free(g_tbls);
+	for (i = 0; i < m; i++)
+		free(frag_ptrs[i]);
+	free(comp_data);
+	free(out);
+	printf("crc time %f\n", crc_time);
+	return NULL;
+}
+
+void *noload_encode_data_compress_after_encode(void *args)
 {
         int i, j, thread_id, k, p, m, flush, crc_opt;
 	unsigned int seed;
